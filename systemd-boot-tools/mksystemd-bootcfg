@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+
+_bin="$( \
+  dirname \
+    "$( \
+      command \
+        -v \
+	  "env")")"
+_lib="${_bin}/../lib"
+_share="${_bin}/../share"
+source \
+  "${_lib}/libcrash-bash/crash-bash"
+
+# shellcheck disable=SC2034
+_global_variables() {
+  local \
+    _field
+  build_date=""
+  out_dir=""
+  cfg_dir=""
+  entry_name=""
+  short_name=""
+  arch_name=""
+  boot_method=""
+  uuids=()
+  attributes=(
+    key
+    kernel
+    ucode
+    initrd
+    ksum
+    isum
+    name
+    drive
+    kparams
+  )
+  for _field in "${attributes[@]}"; do
+    declare \
+      -g \
+      -A \
+      "${_field}"
+  done
+  color=""
+  quiet=""
+}
+
+_requirements() {
+  _check_cmd \
+    'shfmt'
+}
+
+
+# shellcheck disable=SC2016
+# Use graphics-mode output
+_graphic_modules() {
+  local \
+    _cmd=()
+  _cmd=(
+    insmod 
+      "all_video"
+      "font;"
+    if loadfont
+         '"${prefix}/fonts/unicode.pf2"' ';' 'then'
+      insmod
+        'gfxterm;'
+      set 
+        'gfxmode="auto";'
+      terminal_input
+        "console;"
+      terminal_output
+        "gfxterm;"
+    fi';'
+  )
+  echo \
+    "${_cmd[*]}"
+}
+
+# Enable serial console
+_serial_cfg() {
+  local \
+    _cmd=()
+  _cmd=(
+    if serial
+      --unit=0
+      --speed=115200';' 'then'
+      terminal_input
+        --append serial';'
+      terminal_output
+        --append serial';'
+    fi';'
+  )
+  echo \
+    "${_cmd[*]}"
+}
+
+_grub_set() {
+  local \
+    _field="${1}" \
+    _uuid="${2}" \
+    _cmd=()
+  _cmd=(
+    'set'
+      "${_field}=\"$( \
+        _get \
+          "${_field}" \
+          "${_uuid}")\";"
+  )
+  echo \
+    "${_cmd[*]}"
+}
+
+_set_boot_params() {
+  local \
+    _field
+  for _field \
+    in "kernel" \
+       "initrd" \
+       "key" \
+       "ksum" \
+       "isum"; do
+    _grub_set \
+      "${_field}" \
+      "${_uuid}"
+  done
+}
+
+_mount_encrypted() {
+  local \
+    _uuid="${1}" \
+    _label="${2}" \
+    _retries="${3}" \
+    _attempt=1
+  [[ "${_retries}" == "" ]] && \
+    _retries="3"
+  while (( "${_attempt}" <= "${_retries}" )); do
+    _mount_encrypted_cmd
+    _attempt=$(( _attempt + 1))
+  done
+}
+
+# shellcheck disable=SC2016
+_mount_unencrypted() {
+  local \
+    _uuid="${1}" \
+    _label="${2}" \
+    _cmd=()
+  _cmd=(
+    'if [ "${root}" == "memdisk" ]' ';' 'then'
+      "echo"
+        '"Mounting device;"'
+      "echo"
+        "'${_label} (${_uuid})';"
+      'search'
+        '--no-floppy'
+        '--set=root'
+        '--fs-uuid'
+        "'${_uuid}';"
+    'fi;'
+    'if [ "${root}" != "memdisk" ]; then'
+      "$(_set_boot_params)"
+    'fi;'
+  )
+  echo \
+    "${_cmd[*]}"
+}
+
+__format() {
+  local \
+    _code="${1}" \
+    _tmp;
+  if [[ $(command \
+        -v \
+        "shfmt") != "" ]]; then
+    _tmp="$( \
+      mktemp)";
+    echo \
+      "${_code}" > \
+      "${_tmp}";
+    shfmt \
+      -l \
+      -w "${_tmp}";
+    _code="$( \
+      cat \
+        "${_tmp}")";
+  fi
+  printf \
+    "\n%s" \
+    "${_code}"
+}
+
+_format() {
+  local \
+    _code="${1}"
+  __format \
+    "${_code}" | \
+    tail \
+      -n \
+      +2
+}
+
+
+# shellcheck disable=SC2016
+# shellcheck disable=SC1083
+_make_menuentry() {
+  local \
+    _entry_name="${1}" \
+    _short_entry="${2}" \
+    _arch="${3}" \
+    _body=() \
+    _kernel=() \
+    _initrd=() \
+    _options=()
+  _title=(
+    "title"
+      "${_entry_name} (%ARCH%, UEFI)")
+  _sort=(
+    "sort-key"
+      "01"
+  )
+  _kernel=(
+    'linux'
+      "$(_get \
+           "kernel" \
+           "memdisk")"
+      "$(_get \
+           "kparams" \
+           "memdisk")"
+  )
+  _initrd=(
+    'initrd'
+      "$(_get \
+           "initrd" \
+           "memdisk")"
+  )
+  _options=(
+    "$(_get \
+         "kparams" \
+         "memdisk")"
+    )
+  _body=(
+    "${_title[*]}"
+    "${_sort[*]}"
+    "${_kernel[*]}"
+    "${_initrd[*]}"
+    "${_options[*]}"
+  )
+  printf \
+    "%s\n" \
+    "${_body[@]}"
+}
+
+_default_opts() {
+  local \
+    _opts=()
+  _opts=(
+    "default='${_short_entry}';"
+    "timeout=${_menu_timeout:-15};"
+    'timeout_style="menu";'
+  )
+  _format \
+    "${_opts[*]}"
+}
+
+# shellcheck disable=SC2016
+# shellcheck disable=SC1083
+_make_systemd_boot_cfg() {
+  local \
+    _entry_name="${1}" \
+    _short_entry="${2}" \
+    _arch="${3}" \
+    _out_dir="${4}" \
+    _cfg \
+    _entry \
+    _loader \
+    _menuentry
+  _loader="${_out_dir}/loader.conf"
+  _entry="${_out_dir}/entries/01-${_short_entry}-${_arch}-linux.conf"
+  mkdir \
+    -p \
+    "${_out_dir}/entries"
+  if [[ -e "${_loader}" ]]; then
+    _msg_error \
+      "configuration already exists in '${_out_dir}'" \
+      1
+  fi
+  echo \
+    "" >>
+    "${_loader}" 
+  echo \
+  _menuentry=
+    "$(_make_menuentry \
+         "${_entry_name}" \
+         "${_short_entry}" \
+         "${_arch}")" >
+    "${}"
+  #   "$( \
+  #     _shutdown)"  \
+  #   "$( \
+  #     _restart)"
+  # if [[ "${_out_file}" != "" ]]; then
+  #   echo \
+  #     "${_cfg}"  > \
+  #     "${_out_file}"
+  # elif [[ "${_out_file}" == "" ]]; then
+  #   _sho \
+  #     "${_cfg}"
+  # fi
+}
+
+_ucode_auto_detect() {
+  local \
+    _os \
+    _vendor \
+    _ucode
+  _os="$( \
+    uname \
+      -o)"
+  if [[ "${_os}" == "GNU/Linux" || \
+        "${_os}" == "Android" ]]; then
+    _vendor="$( \
+      lscpu | \
+        grep \
+          Vendor | \
+          awk \
+            '{print $NF}')"
+  fi
+  if [[ "${_vendor}" == "GenuineIntel" ]]; then
+    _ucode="intel-ucode.img"
+  elif [[ "${_vendor}" == "AMDisbetter!" || \
+          "${_vendor}" == "AuthenticAMD" ]]; then
+    _ucode="amd-ucode.img"
+  fi
+  echo \
+    "${_ucode}"
+}
+
+# Set defaults and, if present, overrides
+# from arch-grub command line option parameters
+_set_overrides() {
+  _set_override \
+    "build" \
+    "date" \
+    "$(_get_date_human)"
+  _set_override \
+    "out" \
+    "file" \
+    "$(pwd)"
+  _set_override \
+    "entry" \
+    "name" \
+    "Arch Linux"
+  _set_override \
+    "short" \
+    "name" \
+    "arch"
+  _set_override \
+    "arch" \
+    "name" \
+    "x86_64"
+  uuids+=(
+    'memdisk'
+  )
+  _set \
+    "name" \
+    "memdisk" \
+    "efiboot"
+  _set \
+    "kernel" \
+    "memdisk" \
+    "/boot/vmlinuz-linux"
+  _set \
+    "ucode" \
+    "memdisk" \
+    "/boot/$(_ucode_auto_detect)"
+  _set \
+    "initrd" \
+    "memdisk" \
+    "/boot/initramfs-linux.img"
+  _set \
+    "ksum" \
+    "memdisk" \
+    ""
+  _set \
+    "isum" \
+    "memdisk" \
+    ""
+  _set \
+    "drive" \
+    "memdisk" \
+    "ssd"
+  _set \
+    "kparams" \
+    "memdisk" \
+    ""
+  if [[ -v override_quiet ]]; then
+    quiet="${override_quiet}"
+  elif [[ -z "${quiet}" ]]; then
+    quiet="y"
+  fi
+  if [[ -v override_color ]]; then
+    color="${override_color}"
+  elif [[ -z "${color}" ]]; then
+    color="n"
+  fi
+}
+
+# Show help usage, with an exit status.
+# $1: exit status number.
+_usage() {
+  local \
+    _exit="${1}" \
+    _usage_text
+  IFS='' \
+    read \
+      -r \
+      -d '' \
+      _usage_text << \
+        ENDUSAGETEXT || true
+
+Produces a systemd-boot configuration directory.
+
+usage:
+  $(_get "app" "name")
+    [options]
+    -U
+      <fssuid>
+   (-u
+      <fsuuid>)
+   [boot disk options]
+
+  options:
+     -a <arch_name>       Architecture
+                          Default: '$(_get "arch" "name")'
+     -L <entry_name>      Sets an alternative entry name
+                          Default: '$(_get "entry" "name")'
+     -l <short_name>      Short entry name.
+                          Default: '$(_get "short" "name")'
+     -U <fsuuid>          Add an UUID for an encrypted boot disk.
+     -u <fsuuid>          Add an UUID for an unencrypted boot disk.
+     -o <out_dir>         Output configuration directory.
+                          Default: '$(_get "out" "dir")'
+
+     -h                   This message.
+     -c                   Enable color output
+     -v                   Enable verbose output
+
+  boot disk options:
+     -n <name>            Boot disk nickname.
+     -K <kernel>          Kernel path inside the boot disk.
+     -p                   Kernel parameters
+     -k <ksum>            SHA256 sum of the kernel.
+     -I <initrd>          Path of the initrd inside the
+                          boot disks.
+     -i <isum>            SHA256 sum of the initrd.
+     -t                   Drive type ('hdd', 'ssd')
+                          Default: 'ssd'
+     -e <key>             Path of the encryption key inside
+                          the boot disk.
+ENDUSAGETEXT
+  _printf \
+    '%s\n' \
+    "${_usage_text}"
+  exit \
+    "${_exit}"
+}
+
+_display_flags() {
+  local \
+    _flags=(
+      "${1}"
+    ) \
+    _flag
+  for _flag \
+    in "${_flags[@]}"; do
+  _msg_info \
+    "                              ${_flag}"
+  done
+}
+
+# shellcheck disable=SC2154
+_display_devices() {
+  local \
+    _encrypted="${1}" \
+    _uuids=() \
+    _uuid \
+    _field
+  shift \
+    1
+  _uuids=(
+    "$@"
+  )
+  for _uuid \
+    in "${_uuids[@]}"; do
+    for _field \
+      in "${attributes[@]}"; do
+      printf \
+        -v \
+          "_display_${_field}" \
+        "%s" \
+        "$( \
+          _get \
+            "${_field}" \
+            "${_uuid}")"
+    done
+    _msg_info \
+      "                     Name:     ${_display_name}"
+    _msg_info \
+      "                     UUID:     ${_display_uuid:-None}"
+    [[ "${_encrypted}" == "true" ]] && \
+      _msg_info \
+        "                      Key:     ${_display_key:-Passphrase}"
+    _msg_info \
+      "                   Kernel:     ${_display_kernel}"
+    _msg_info \
+      "                   Initrd:     ${_display_initrd}"
+    _msg_info \
+      "               Micro code:     ${_display_ucode}"
+    _msg_info \
+      "          Kernel checksum:     ${_display_ksum:-None}"
+    _msg_info \
+      "          Initrd checksum:     ${_display_isum:-None}"
+    _msg_info \
+      "               Drive type:     ${_display_drive}"
+    _msg_info \
+      "        Kernel Parameters:     ${_display_kparams}"
+
+    _msg_info \
+      ""
+  done
+}
+
+# Shows configuration options.
+_show_config() {
+  # shellcheck disable=SC2207
+  _out_file="$( \
+    _get \
+      "out" \
+      "file")"
+  [[ \
+    "${_out_file}" == "" ]] && \
+    _out_file="stdout"
+  _msg_info "${app_name} configuration"
+  _msg_info "               Build Date:   $(_get "build" "date")"
+  _msg_info "             Architecture:   $(_get "arch" "name")"
+  _msg_info "               Entry name:   $(_get "entry" "name")"
+  _msg_info "               Short name:   $(_get "short" "name")"
+  _msg_info "                   drives:"
+  _msg_info ""
+  _display_devices                "true"  "${uuids[@]}"
+  _msg_info "             Out directory:   $(_get "out" "dir")"
+}
+
+_globals
+_global_variables
+_requirements
+# shellcheck disable=SC2004
+# shellcheck disable=SC2034
+while \
+  getopts \
+    'a:L:l:U:K:k:m:I:i:n:e:t:p:o:cvh?' \
+    arg; do
+  case \
+    "${arg}" in
+    a) override_arch_name="${OPTARG}" ;;
+    L) override_entry_name="${OPTARG}" ;;
+    l) override_short_name="${OPTARG}" ;;
+    U) _uuid="${OPTARG}" && \
+       uuids+=(
+         "${_uuid}"
+       );;
+    K) kernel[${_uuid}]="${OPTARG}";;
+    k) ksum[${_uuid}]="${OPTARG}";;
+    m) ucode[${_uuid}]="${OPTARG}" ;;
+    I) initrd[${_uuid}]="${OPTARG}";;
+    i) isum[${_uuid}]="${OPTARG}";;
+    n) name[${_uuid}]="${OPTARG}";;  
+    e) key[${_uuid}]="${OPTARG}";;
+    t) drive[${_uuid}]="${OPTARG}";;
+    p) kparams[${_uuid}]="${OPTARG}";;
+    o) override_out_dir="${OPTARG}";;
+    c) override_color="y" ;;
+    v) override_quiet="n" ;;
+    h|?) _set_overrides && \
+         _usage \
+           0 ;;
+    *)
+    _msg_error \
+      "Invalid argument '${arg}'" \
+      0
+    _usage \
+      1
+    ;;
+  esac
+done
+shift \
+  $(( \
+    OPTIND - 1 \
+  ))
+# shellcheck disable=SC2034
+(( ${#} == 0 )) && \
+  out=""
+# shellcheck disable=SC2034
+(( ${#} != 0 )) && \
+  out="$( \
+    realpath \
+      -q -- \
+      "${1}")"
+_set_overrides
+_show_config
+_make_systemd_boot_cfg \
+  "$( \
+    _get \
+      "entry" \
+      "name")" \
+  "$( \
+    _get \
+      "short" \
+      "name")" \
+  "$( \
+    _get \
+      "arch" \
+      "name")" \
+  "$( \
+    _get \
+      "out" \
+      "dir")"
+# vim:set sw=2 sts=-1 et:
